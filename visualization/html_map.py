@@ -5,8 +5,8 @@ import json
 import os
 import math
 
-from city.graph import CityGraph, NodeId
-from domain.models import Plan, Vehicle, DeliveryRequest  # DeliveryRequest на будущее
+from city.graph import CityGraph
+from domain.models import Plan, Vehicle
 from algorithms.a_star import astar_shortest_path
 
 
@@ -30,8 +30,7 @@ def _compute_screen_coords(
     coords: Dict[str, Dict[str, float]] = {}
     for nid, node in graph.nodes.items():
         sx = padding + (node.x - min_x) * scale_x
-        # инвертируем y, чтобы "север" был сверху
-        sy = padding + (max_y - node.y) * scale_y
+        sy = padding + (max_y - node.y) * scale_y  # инверсия Y
         coords[nid] = {"x": sx, "y": sy}
     return coords
 
@@ -43,7 +42,7 @@ def _build_full_route_nodes(
 ) -> Dict[str, List[str]]:
     """
     Для каждой машины строим последовательность узлов:
-    старт -> все заказы -> (опционально) депо.
+    старт -> все заказы -> депо.
     """
     result: Dict[str, List[str]] = {}
     v_index = {v.id: v for v in vehicles}
@@ -71,46 +70,78 @@ def _build_full_route_nodes(
 
 def export_plan_to_html(
     graph: CityGraph,
-    plan: Plan,
+    plans_by_algo: Dict[str, Plan],
     vehicles: List[Vehicle],
     output_path: str = "output/campus_routes.html",
 ) -> None:
     """
-    Генерирует самодостаточный HTML с:
-      - картой города,
-      - маршрутами машин,
-      - анимацией движения машин по маршрутам (один прогон),
-      - pan/zoom мышью.
-    Дороги серые, точки-доставки сразу окрашены в цвет машины, после визита становятся крупнее.
+    Генерирует HTML, в котором можно переключать алгоритм (Greedy / Monte Carlo)
+    через выпадающий список. Для каждого алгоритма:
+
+      - свои маршруты машин,
+      - свои delivery-узлы,
+      - своя анимация.
+
+    Ноды-доставки сразу окрашены в цвет машины; после визита становятся больше.
+    Добавлен таймер анимации (t = ... s), который сбрасывается при смене алгоритма.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     screen_coords = _compute_screen_coords(graph)
-    full_routes = _build_full_route_nodes(graph, plan, vehicles)
 
-    # множество вершин, куда нужно доставлять (по Plan)
-    delivery_nodes_set = set()
-    for route in plan.routes.values():
-        for req in route.stops:
-            delivery_nodes_set.add(req.node)
+    # предполагаем, что у всех планов один и тот же depot
+    any_plan = next(iter(plans_by_algo.values()))
+    depot = any_plan.depot
 
-    # считаем, в какой момент пути (по пикселям) каждая машина достигает каждой delivery-вершины
-    deliveries_meta = []  # список {vehicle_id, node_id, arrival_dist}
-    for vid, node_seq in full_routes.items():
-        cum = 0.0
-        seen_for_this_route = set()
-        for i in range(len(node_seq) - 1):
-            a_id = node_seq[i]
-            b_id = node_seq[i + 1]
-            a = screen_coords[a_id]
-            b = screen_coords[b_id]
-            seg_len = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
-            cum += seg_len
-            if b_id in delivery_nodes_set and b_id not in seen_for_this_route:
-                deliveries_meta.append(
-                    {"vehicle_id": vid, "node_id": b_id, "arrival_dist": cum}
-                )
-                seen_for_this_route.add(b_id)
+    algorithms_payload = []
+
+    for algo_name, plan in plans_by_algo.items():
+        full_routes = _build_full_route_nodes(graph, plan, vehicles)
+
+        delivery_nodes_set = set()
+        for route in plan.routes.values():
+            for req in route.stops:
+                delivery_nodes_set.add(req.node)
+
+        deliveries_meta = []
+        for vid, node_seq in full_routes.items():
+            cum = 0.0
+            seen_for_this_route = set()
+            for i in range(len(node_seq) - 1):
+                a_id = node_seq[i]
+                b_id = node_seq[i + 1]
+                a = screen_coords[a_id]
+                b = screen_coords[b_id]
+                seg_len = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
+                cum += seg_len
+                if b_id in delivery_nodes_set and b_id not in seen_for_this_route:
+                    deliveries_meta.append(
+                        {"vehicle_id": vid, "node_id": b_id, "arrival_dist": cum}
+                    )
+                    seen_for_this_route.add(b_id)
+
+        routes_payload = [
+            {
+                "vehicle_id": vid,
+                "nodes": [
+                    {
+                        "id": nid,
+                        "x": screen_coords[nid]["x"],
+                        "y": screen_coords[nid]["y"],
+                    }
+                    for nid in nodes
+                ],
+            }
+            for vid, nodes in full_routes.items()
+        ]
+
+        algorithms_payload.append({
+            "id": algo_name,
+            "label": algo_name,
+            "routes": routes_payload,
+            "delivery_nodes": list(delivery_nodes_set),
+            "deliveries": deliveries_meta,
+        })
 
     data = {
         "nodes": [
@@ -126,23 +157,8 @@ def export_plan_to_html(
             for nid in graph.nodes.keys()
             for e in graph.neighbors(nid)
         ],
-        "routes": [
-            {
-                "vehicle_id": vid,
-                "nodes": [
-                    {
-                        "id": nid,
-                        "x": screen_coords[nid]["x"],
-                        "y": screen_coords[nid]["y"],
-                    }
-                    for nid in nodes
-                ],
-            }
-            for vid, nodes in full_routes.items()
-        ],
-        "depot": plan.depot,
-        "delivery_nodes": list(delivery_nodes_set),
-        "deliveries": deliveries_meta,
+        "depot": depot,
+        "algorithms": algorithms_payload,
     }
 
     json_data = json.dumps(data)
@@ -169,9 +185,10 @@ def export_plan_to_html(
       box-shadow: 0 18px 40px rgba(0,0,0,0.6);
       padding: 16px 20px 24px;
       border: 1px solid #1f2937;
+      min-width: 960px;
     }}
     #title {{
-      margin: 0 0 6px 0;
+      margin: 0 0 4px 0;
       font-size: 18px;
       font-weight: 600;
     }}
@@ -179,6 +196,32 @@ def export_plan_to_html(
       margin: 0 0 10px 0;
       font-size: 13px;
       color: #9ca3af;
+    }}
+    #controls {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+      font-size: 13px;
+      justify-content: space-between;
+    }}
+    #algo-box {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    #algo-select {{
+      background: #020617;
+      color: #e5e7eb;
+      border-radius: 6px;
+      border: 1px solid #374151;
+      padding: 4px 8px;
+      font-size: 13px;
+    }}
+    #timer {{
+      font-size: 13px;
+      color: #e5e7eb;
+      font-variant-numeric: tabular-nums;
     }}
     #legend {{
       display: flex;
@@ -211,7 +254,14 @@ def export_plan_to_html(
 <body>
 <div id="card">
   <h1 id="title">Constructor University — Delivery Routes</h1>
-  <p id="subtitle">Nodes are colored by vehicle; delivered requests become larger</p>
+  <p id="subtitle">Choose algorithm, drag to pan, scroll to zoom</p>
+  <div id="controls">
+    <div id="algo-box">
+      <span>Algorithm:</span>
+      <select id="algo-select"></select>
+    </div>
+    <div id="timer">t = 0.0 s</div>
+  </div>
   <div id="legend"></div>
   <canvas id="map" width="900" height="700"></canvas>
 </div>
@@ -236,6 +286,9 @@ def export_plan_to_html(
 
   const canvas = document.getElementById("map");
   const ctx = canvas.getContext("2d");
+  const legendEl = document.getElementById("legend");
+  const algoSelect = document.getElementById("algo-select");
+  const timerEl = document.getElementById("timer");
 
   let offsetX = 0;
   let offsetY = 0;
@@ -245,46 +298,90 @@ def export_plan_to_html(
   let dragStartX = 0;
   let dragStartY = 0;
 
-  // 1) Сначала готовим маршруты
-  const ROUTES = DATA.routes.map((route, idx) => {{
-    const pts = route.nodes;
-    const segments = [];
-    let totalLen = 0;
-    for (let i = 0; i < pts.length - 1; i++) {{
-      const a = pts[i];
-      const b = pts[i + 1];
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const len = Math.hypot(dx, dy);
-      if (len > 0) {{
-        segments.push({{ a, b, len }});
-        totalLen += len;
+  let currentAlgoIndex = 0;
+  let ROUTES = [];
+  let DELIVERY_NODES = new Set();
+  let deliveries = [];
+  let visitedDeliveryNodes = new Set();
+  let deliveryColorByNode = new Map();
+  let lastTime = null;
+  let simTime = 0.0; // виртуальное время анимации (секунды)
+
+  function updateTimerLabel() {{
+    if (!timerEl) return;
+    timerEl.textContent = "t = " + simTime.toFixed(1) + " s";
+  }}
+
+  function rebuildLegend() {{
+    legendEl.innerHTML = "";
+    ROUTES.forEach((route) => {{
+      const item = document.createElement("div");
+      item.className = "legend-item";
+      const swatch = document.createElement("div");
+      swatch.className = "legend-swatch";
+      swatch.style.backgroundColor = route.color;
+      const label = document.createElement("span");
+      label.textContent = route.vehicle_id;
+      item.appendChild(swatch);
+      item.appendChild(label);
+      legendEl.appendChild(item);
+    }});
+  }}
+
+  function initAlgorithm(index) {{
+    currentAlgoIndex = index;
+    const algo = DATA.algorithms[index];
+
+    // 1) маршруты
+    ROUTES = algo.routes.map((route, idx) => {{
+      const pts = route.nodes;
+      const segments = [];
+      let totalLen = 0;
+      for (let i = 0; i < pts.length - 1; i++) {{
+        const a = pts[i];
+        const b = pts[i + 1];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const len = Math.hypot(dx, dy);
+        if (len > 0) {{
+          segments.push({{ a, b, len }});
+          totalLen += len;
+        }}
+      }}
+      return {{
+        vehicle_id: route.vehicle_id,
+        color: colors[idx % colors.length],
+        segments,
+        totalLen,
+        dist: 0,
+        finished: false,
+      }};
+    }});
+
+    // 2) delivery-структуры
+    DELIVERY_NODES = new Set(algo.delivery_nodes || []);
+    deliveries = (algo.deliveries || []).map(
+      d => Object.assign({{ served: false }}, d)
+    );
+    visitedDeliveryNodes = new Set();
+    deliveryColorByNode = new Map();
+
+    // ноды сразу красятся в цвет машины
+    for (const d of deliveries) {{
+      const route = ROUTES.find(r => r.vehicle_id === d.vehicle_id);
+      if (route && !deliveryColorByNode.has(d.node_id)) {{
+        deliveryColorByNode.set(d.node_id, route.color);
       }}
     }}
-    return {{
-      vehicle_id: route.vehicle_id,
-      color: colors[idx % colors.length],
-      segments,
-      totalLen,
-      dist: 0,
-      finished: false,
-    }};
-  }});
 
-  // 2) Структуры для доставок
-  const DELIVERY_NODES = new Set(DATA.delivery_nodes || []);
-  const deliveries = (DATA.deliveries || []).map(
-    d => Object.assign({{ served: false }}, d)
-  );
-  const visitedDeliveryNodes = new Set();
-  const deliveryColorByNode = new Map();
+    // сбрасываем таймер и время
+    simTime = 0.0;
+    lastTime = null;
+    updateTimerLabel();
 
-  // 3) Сразу красим каждую ноду-заказ в цвет её машины
-  for (const d of deliveries) {{
-    const route = ROUTES.find(r => r.vehicle_id === d.vehicle_id);
-    if (route && !deliveryColorByNode.has(d.node_id)) {{
-      deliveryColorByNode.set(d.node_id, route.color);
-    }}
+    rebuildLegend();
+    draw();
+    requestAnimationFrame(animate);
   }}
 
   function draw() {{
@@ -453,24 +550,21 @@ def export_plan_to_html(
     draw();
   }}, {{ passive: false }});
 
-  // легенда по машинам
-  const legendEl = document.getElementById("legend");
-  ROUTES.forEach((route) => {{
-    const item = document.createElement("div");
-    item.className = "legend-item";
-    const swatch = document.createElement("div");
-    swatch.className = "legend-swatch";
-    swatch.style.backgroundColor = route.color;
-    const label = document.createElement("span");
-    label.textContent = route.vehicle_id;
-    item.appendChild(swatch);
-    item.appendChild(label);
-    legendEl.appendChild(item);
+  // заполнение селекта алгоритмов
+  DATA.algorithms.forEach((algo, idx) => {{
+    const opt = document.createElement("option");
+    opt.value = String(idx);
+    opt.textContent = algo.label;
+    algoSelect.appendChild(opt);
   }});
 
-  // Анимация: один проход
-  let lastTime = null;
-  const SPEED = 80; // пикселей в секунду вдоль маршрута
+  algoSelect.addEventListener("change", (e) => {{
+    const idx = parseInt(e.target.value, 10) || 0;
+    initAlgorithm(idx);
+  }});
+
+  // Анимация: один проход для текущего алгоритма
+  const SPEED = 80; // пикселей в секунду
 
   function animate(timestamp) {{
     if (lastTime === null) {{
@@ -501,9 +595,12 @@ def export_plan_to_html(
       if (route.dist >= d.arrival_dist) {{
         d.served = true;
         visitedDeliveryNodes.add(d.node_id);
-        // цвет не меняем: он уже задан по машине
       }}
     }}
+
+    // обновляем виртуальное время и таймер
+    simTime += dt;
+    updateTimerLabel();
 
     draw();
 
@@ -512,8 +609,11 @@ def export_plan_to_html(
     }}
   }}
 
-  draw();
-  requestAnimationFrame(animate);
+  // старт: первый алгоритм
+  if (DATA.algorithms.length > 0) {{
+    algoSelect.value = "0";
+    initAlgorithm(0);
+  }}
 </script>
 </body>
 </html>
