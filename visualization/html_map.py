@@ -1,6 +1,6 @@
 # visualization/html_map.py
 from __future__ import annotations
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import json
 import os
 import math
@@ -41,8 +41,8 @@ def _build_full_route_nodes(
     vehicles: List[Vehicle],
 ) -> Dict[str, List[str]]:
     """
-    Для каждой машины строим последовательность узлов:
-    старт -> все заказы -> депо.
+    Строим полный список узлов для анимации, учитывая capacity:
+    если места не хватает -> машина возвращается на depot и начинает новый рейс.
     """
     result: Dict[str, List[str]] = {}
     v_index = {v.id: v for v in vehicles}
@@ -50,21 +50,40 @@ def _build_full_route_nodes(
     for vid, route in plan.routes.items():
         v = v_index[vid]
         cur = v.start_node
+        cap_left = v.capacity
         nodes_seq: List[str] = [cur]
 
-        for req in route.stops:
-            path, _ = astar_shortest_path(graph, cur, req.node)
-            if path is None:
-                continue
-            nodes_seq.extend(path[1:])
-            cur = req.node
+        if cap_left <= 0:
+            result[vid] = nodes_seq
+            continue
 
-        if route.stops:
+        for req in route.stops:
+            demand = getattr(req, "demand", 1)
+
+            # если не хватает места → сначала возвращаемся на depot
+            if cap_left < demand:
+                if cur != plan.depot:
+                    path, _ = astar_shortest_path(graph, cur, plan.depot)
+                    if path is not None:
+                        nodes_seq.extend(path[1:])
+                        cur = plan.depot
+                cap_left = v.capacity
+
+            # едем к заказу
+            path, _ = astar_shortest_path(graph, cur, req.node)
+            if path is not None:
+                nodes_seq.extend(path[1:])
+                cur = req.node
+                cap_left -= demand
+
+        # в конце возвращаемся на depot
+        if cur != plan.depot:
             path, _ = astar_shortest_path(graph, cur, plan.depot)
             if path is not None:
                 nodes_seq.extend(path[1:])
 
         result[vid] = nodes_seq
+
     return result
 
 
@@ -75,21 +94,27 @@ def export_plan_to_html(
     output_path: str = "output/campus_routes.html",
 ) -> None:
     """
-    Генерирует HTML, в котором можно переключать алгоритм (Greedy / Monte Carlo)
-    через выпадающий список. Для каждого алгоритма:
-
-      - свои маршруты машин,
-      - свои delivery-узлы,
-      - своя анимация.
-
-    Ноды-доставки сразу окрашены в цвет машины; после визита становятся больше.
-    Добавлен таймер анимации (t = ... s), который сбрасывается при смене алгоритма.
+    plans_by_algo: { "Greedy": Plan, "MonteCarlo": Plan, ... }
+    На HTML-странице можно выбрать алгоритм из выпадающего списка.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     screen_coords = _compute_screen_coords(graph)
 
-    # предполагаем, что у всех планов один и тот же depot
+    # считаем время проезда по рёбрам один раз
+    edge_time_map: Dict[Tuple[str, str], float] = {}
+    edges_json = []
+    for nid in graph.nodes.keys():
+        for e in graph.neighbors(nid):
+            base_time = getattr(e, "base_travel_time", 1.0)
+            edges_json.append({
+                "src": e.src,
+                "dst": e.dst,
+                "base_time": base_time,
+            })
+            edge_time_map[(e.src, e.dst)] = base_time
+
+    # предполагаем, что depot одинаковый для всех планов
     any_plan = next(iter(plans_by_algo.values()))
     depot = any_plan.depot
 
@@ -98,25 +123,36 @@ def export_plan_to_html(
     for algo_name, plan in plans_by_algo.items():
         full_routes = _build_full_route_nodes(graph, plan, vehicles)
 
+        # кто отвечает за какую ноду-заказ: node_id -> vehicle_id
+        owner_by_node: Dict[str, str] = {}
         delivery_nodes_set = set()
-        for route in plan.routes.values():
+        for vid, route in plan.routes.items():
             for req in route.stops:
+                owner_by_node[req.node] = vid
                 delivery_nodes_set.add(req.node)
 
+        # время прибытия машины к "своим" delivery-нодам
         deliveries_meta = []
         for vid, node_seq in full_routes.items():
-            cum = 0.0
+            cum_time = 0.0
             seen_for_this_route = set()
             for i in range(len(node_seq) - 1):
                 a_id = node_seq[i]
                 b_id = node_seq[i + 1]
-                a = screen_coords[a_id]
-                b = screen_coords[b_id]
-                seg_len = math.hypot(b["x"] - a["x"], b["y"] - a["y"])
-                cum += seg_len
-                if b_id in delivery_nodes_set and b_id not in seen_for_this_route:
+                seg_time = edge_time_map.get((a_id, b_id), 0.0)
+                cum_time += seg_time
+
+                if (
+                    b_id in delivery_nodes_set
+                    and owner_by_node.get(b_id) == vid
+                    and b_id not in seen_for_this_route
+                ):
                     deliveries_meta.append(
-                        {"vehicle_id": vid, "node_id": b_id, "arrival_dist": cum}
+                        {
+                            "vehicle_id": vid,
+                            "node_id": b_id,
+                            "arrival_time": cum_time,
+                        }
                     )
                     seen_for_this_route.add(b_id)
 
@@ -152,24 +188,21 @@ def export_plan_to_html(
             }
             for nid in graph.nodes.keys()
         ],
-        "edges": [
-            {"src": e.src, "dst": e.dst}
-            for nid in graph.nodes.keys()
-            for e in graph.neighbors(nid)
-        ],
+        "edges": edges_json,
         "depot": depot,
         "algorithms": algorithms_payload,
     }
 
     json_data = json.dumps(data)
 
-    html = f"""<!DOCTYPE html>
+    # шаблон без f-string, чтобы не сойти с ума с {{ }}
+    html_template = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <title>City routes</title>
   <style>
-    body {{
+    body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       margin: 0;
       background: #020617;
@@ -178,77 +211,77 @@ def export_plan_to_html(
       justify-content: center;
       align-items: center;
       height: 100vh;
-    }}
-    #card {{
+    }
+    #card {
       background: #020617;
       border-radius: 18px;
       box-shadow: 0 18px 40px rgba(0,0,0,0.6);
       padding: 16px 20px 24px;
       border: 1px solid #1f2937;
       min-width: 960px;
-    }}
-    #title {{
+    }
+    #title {
       margin: 0 0 4px 0;
       font-size: 18px;
       font-weight: 600;
-    }}
-    #subtitle {{
+    }
+    #subtitle {
       margin: 0 0 10px 0;
       font-size: 13px;
       color: #9ca3af;
-    }}
-    #controls {{
+    }
+    #controls {
       display: flex;
       align-items: center;
       gap: 12px;
       margin-bottom: 8px;
       font-size: 13px;
       justify-content: space-between;
-    }}
-    #algo-box {{
+    }
+    #algo-box {
       display: flex;
       align-items: center;
       gap: 8px;
-    }}
-    #algo-select {{
+    }
+    #algo-select {
       background: #020617;
       color: #e5e7eb;
       border-radius: 6px;
       border: 1px solid #374151;
       padding: 4px 8px;
       font-size: 13px;
-    }}
-    #timer {{
+    }
+    #timer {
       font-size: 13px;
       color: #e5e7eb;
       font-variant-numeric: tabular-nums;
-    }}
-    #legend {{
+    }
+    #legend {
       display: flex;
       gap: 12px;
       margin-bottom: 8px;
       font-size: 12px;
       flex-wrap: wrap;
-    }}
-    .legend-item {{
+    }
+    .legend-item {
       display: inline-flex;
       align-items: center;
       gap: 5px;
-    }}
-    .legend-swatch {{
+    }
+    .legend-swatch {
       width: 14px;
       height: 3px;
       border-radius: 999px;
-    }}
-    canvas {{
+    }
+    canvas {
       border-radius: 12px;
       background: #020617;
       border: 1px solid #1f2937;
       cursor: grab;
-    }}
-    canvas:active {{
+    }
+    canvas:active {
       cursor: grabbing;
-    }}
+    }
   </style>
 </head>
 <body>
@@ -267,21 +300,11 @@ def export_plan_to_html(
 </div>
 
 <script>
-  const DATA = {json_data};
+  const DATA = {{JSON_DATA}};
 
   const colors = [
     "#f97316", "#22c55e", "#3b82f6", "#e11d48",
     "#a855f7", "#14b8a6", "#facc15"
-  ];
-
-  const dashPatterns = [
-    [],            // solid
-    [10, 6],       // long dash
-    [4, 4],        // medium dash
-    [14, 4, 2, 4], // dash-dot
-    [2, 6],        // dotted-ish
-    [1, 3],        // fine dots
-    [12, 3, 3, 3], // long-short pattern
   ];
 
   const canvas = document.getElementById("map");
@@ -289,6 +312,12 @@ def export_plan_to_html(
   const legendEl = document.getElementById("legend");
   const algoSelect = document.getElementById("algo-select");
   const timerEl = document.getElementById("timer");
+
+  // карта base_time для ребра src->dst
+  const EDGE_TIME = new Map();
+  for (const e of DATA.edges) {
+    EDGE_TIME.set(e.src + "->" + e.dst, e.base_time ?? 1.0);
+  }
 
   let offsetX = 0;
   let offsetY = 0;
@@ -304,17 +333,17 @@ def export_plan_to_html(
   let deliveries = [];
   let visitedDeliveryNodes = new Set();
   let deliveryColorByNode = new Map();
-  let lastTime = null;
-  let simTime = 0.0; // виртуальное время анимации (секунды)
+  let lastAnimTime = null;
+  let simTime = 0.0;
+  const SPEED = 10.0; // множитель “ускорения” времени
 
-  function updateTimerLabel() {{
-    if (!timerEl) return;
+  function updateTimerLabel() {
     timerEl.textContent = "t = " + simTime.toFixed(1) + " s";
-  }}
+  }
 
-  function rebuildLegend() {{
+  function rebuildLegend() {
     legendEl.innerHTML = "";
-    ROUTES.forEach((route) => {{
+    ROUTES.forEach((route) => {
       const item = document.createElement("div");
       item.className = "legend-item";
       const swatch = document.createElement("div");
@@ -325,66 +354,75 @@ def export_plan_to_html(
       item.appendChild(swatch);
       item.appendChild(label);
       legendEl.appendChild(item);
-    }});
-  }}
+    });
+  }
 
-  function initAlgorithm(index) {{
+  function initAlgorithm(index) {
     currentAlgoIndex = index;
     const algo = DATA.algorithms[index];
 
-    // 1) маршруты
-    ROUTES = algo.routes.map((route, idx) => {{
+    // 1) маршруты для этого алгоритма
+    ROUTES = algo.routes.map((route, idx) => {
       const pts = route.nodes;
       const segments = [];
       let totalLen = 0;
-      for (let i = 0; i < pts.length - 1; i++) {{
+      let totalTime = 0;
+
+      for (let i = 0; i < pts.length - 1; i++) {
         const a = pts[i];
         const b = pts[i + 1];
         const dx = b.x - a.x;
         const dy = b.y - a.y;
         const len = Math.hypot(dx, dy);
-        if (len > 0) {{
-          segments.push({{ a, b, len }});
+
+        const key = a.id + "->" + b.id;
+        const baseTime = EDGE_TIME.get(key) ?? (len / 50.0);
+
+        if (len > 0) {
+          segments.push({ a, b, len, baseTime });
           totalLen += len;
-        }}
-      }}
-      return {{
+          totalTime += baseTime;
+        }
+      }
+
+      return {
         vehicle_id: route.vehicle_id,
         color: colors[idx % colors.length],
         segments,
         totalLen,
-        dist: 0,
-        finished: false,
-      }};
-    }});
+        totalTime,
+        time: 0,
+        finished: false
+      };
+    });
 
     // 2) delivery-структуры
     DELIVERY_NODES = new Set(algo.delivery_nodes || []);
     deliveries = (algo.deliveries || []).map(
-      d => Object.assign({{ served: false }}, d)
+      d => Object.assign({ served: false }, d)
     );
     visitedDeliveryNodes = new Set();
     deliveryColorByNode = new Map();
 
-    // ноды сразу красятся в цвет машины
-    for (const d of deliveries) {{
+    // заранее красим ноды в цвет машин
+    for (const d of deliveries) {
       const route = ROUTES.find(r => r.vehicle_id === d.vehicle_id);
-      if (route && !deliveryColorByNode.has(d.node_id)) {{
+      if (route && !deliveryColorByNode.has(d.node_id)) {
         deliveryColorByNode.set(d.node_id, route.color);
-      }}
-    }}
+      }
+    }
 
-    // сбрасываем таймер и время
+    // сброс времени
     simTime = 0.0;
-    lastTime = null;
+    lastAnimTime = null;
     updateTimerLabel();
 
     rebuildLegend();
     draw();
     requestAnimationFrame(animate);
-  }}
+  }
 
-  function draw() {{
+  function draw() {
     ctx.save();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.translate(offsetX, offsetY);
@@ -398,59 +436,52 @@ def export_plan_to_html(
     ctx.strokeStyle = "#1f2937";
     ctx.lineWidth = 1;
     ctx.beginPath();
-    for (const edge of DATA.edges) {{
+    for (const edge of DATA.edges) {
       const src = DATA.nodes.find(n => n.id === edge.src);
       const dst = DATA.nodes.find(n => n.id === edge.dst);
       ctx.moveTo(src.x, src.y);
       ctx.lineTo(dst.x, dst.y);
-    }}
+    }
     ctx.stroke();
 
-    // цветные "следы" машин
-    ROUTES.forEach((route, idx) => {{
-      if (route.segments.length === 0 || route.dist <= 0) return;
+    // цветные следы по уже проезженному ВРЕМЕНИ
+    for (const route of ROUTES) {
+      if (route.segments.length === 0 || route.time <= 0) continue;
 
-      let remaining = route.dist;
+      let remainingTime = route.time;
 
-      ctx.save();
       ctx.strokeStyle = route.color;
-      ctx.lineWidth = 6;
-      ctx.setLineDash(dashPatterns[idx % dashPatterns.length]);
-
+      ctx.lineWidth = 4;
       ctx.beginPath();
       let started = false;
 
-      for (const seg of route.segments) {{
-        if (remaining <= 0) break;
+      for (const seg of route.segments) {
+        if (remainingTime <= 0) break;
 
-        const a = seg.a;
-        const b = seg.b;
-        const len = seg.len;
-        const drawLen = Math.min(len, remaining);
-        const t = len === 0 ? 0 : drawLen / len;
+        const used = Math.min(seg.baseTime, remainingTime);
+        const t = seg.baseTime === 0 ? 0 : (used / seg.baseTime);
 
-        const sx = a.x;
-        const sy = a.y;
-        const ex = a.x + (b.x - a.x) * t;
-        const ey = a.y + (b.y - a.y) * t;
+        const sx = seg.a.x;
+        const sy = seg.a.y;
+        const ex = seg.a.x + (seg.b.x - seg.a.x) * t;
+        const ey = seg.a.y + (seg.b.y - seg.a.y) * t;
 
-        if (!started) {{
+        if (!started) {
           ctx.moveTo(sx, sy);
           started = true;
-        }} else {{
+        } else {
           ctx.lineTo(sx, sy);
-        }}
+        }
         ctx.lineTo(ex, ey);
 
-        remaining -= drawLen;
-      }}
+        remainingTime -= used;
+      }
 
       ctx.stroke();
-      ctx.restore();
-    }});
+    }
 
     // узлы
-    for (const node of DATA.nodes) {{
+    for (const node of DATA.nodes) {
       const nodeId = node.id;
       const isDepot = (nodeId === DATA.depot);
       const isDelivery = DELIVERY_NODES.has(nodeId);
@@ -459,165 +490,163 @@ def export_plan_to_html(
       let fillColor = "#e5e7eb";
       let radius = 3;
 
-      if (isDepot) {{
+      if (isDepot) {
         fillColor = "#22c55e";
         radius = 6;
-      }} else if (isDelivery) {{
+      } else if (isDelivery) {
         const vehicleColor = deliveryColorByNode.get(nodeId) || "#ef4444";
-        if (!isVisited) {{
+        if (!isVisited) {
           fillColor = vehicleColor;
           radius = 6;
-        }} else {{
+        } else {
           fillColor = vehicleColor;
           radius = 8;
-        }}
-      }}
+        }
+      }
 
       ctx.beginPath();
       ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
       ctx.fillStyle = fillColor;
       ctx.fill();
 
-      if (isDelivery) {{
+      if (isDelivery) {
         ctx.lineWidth = 1;
         ctx.strokeStyle = "#111827";
         ctx.stroke();
-      }}
+      }
 
       ctx.fillStyle = "#9ca3af";
       ctx.font = "10px system-ui";
       ctx.textAlign = "center";
       ctx.fillText(node.id, node.x, node.y - (radius + 4));
-    }}
+    }
 
     // машинки
-    for (const route of ROUTES) {{
-      if (route.segments.length === 0 || route.totalLen === 0) continue;
+    for (const route of ROUTES) {
+      if (route.segments.length === 0 || route.totalTime === 0) continue;
 
-      let d = route.dist;
-      if (d <= 0) continue;
+      let tRemain = route.time;
+      if (tRemain <= 0) continue;
 
-      for (const seg of route.segments) {{
-        if (d <= seg.len) {{
-          const t = seg.len === 0 ? 0 : d / seg.len;
-          const x = seg.a.x + (seg.b.x - seg.a.x) * t;
-          const y = seg.a.y + (seg.b.y - seg.a.y) * t;
+      for (const seg of route.segments) {
+        if (tRemain <= seg.baseTime) {
+          const f = seg.baseTime === 0 ? 0 : (tRemain / seg.baseTime);
+          const x = seg.a.x + (seg.b.x - seg.a.x) * f;
+          const y = seg.a.y + (seg.b.y - seg.a.y) * f;
 
           ctx.beginPath();
           ctx.fillStyle = route.color;
-          ctx.arc(x, y, 8, 0, Math.PI * 2);
+          ctx.arc(x, y, 6, 0, Math.PI * 2);
           ctx.fill();
           break;
-        }}
-        d -= seg.len;
-      }}
-    }}
+        }
+        tRemain -= seg.baseTime;
+      }
+    }
 
     ctx.restore();
-  }}
+  }
 
-  // Панорамирование
-  canvas.addEventListener("mousedown", (e) => {{
+  // панорамирование
+  canvas.addEventListener("mousedown", (e) => {
     isDragging = true;
     dragStartX = e.clientX - offsetX;
     dragStartY = e.clientY - offsetY;
-  }});
-  window.addEventListener("mouseup", () => {{
+  });
+  window.addEventListener("mouseup", () => {
     isDragging = false;
-  }});
-  canvas.addEventListener("mousemove", (e) => {{
+  });
+  canvas.addEventListener("mousemove", (e) => {
     if (!isDragging) return;
     offsetX = e.clientX - dragStartX;
     offsetY = e.clientY - dragStartY;
     draw();
-  }});
+  });
 
-  // Зум колесиком
-  canvas.addEventListener("wheel", (e) => {{
+  // зум колесиком
+  canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
     const zoomFactor = 1.05;
     const mouseX = (e.offsetX - offsetX) / scale;
     const mouseY = (e.offsetY - offsetY) / scale;
 
-    if (e.deltaY < 0) {{
+    if (e.deltaY < 0) {
       scale *= zoomFactor;
-    }} else {{
+    } else {
       scale /= zoomFactor;
-    }}
+    }
 
     offsetX = e.offsetX - mouseX * scale;
     offsetY = e.offsetY - mouseY * scale;
     draw();
-  }}, {{ passive: false }});
+  }, { passive: false });
 
   // заполнение селекта алгоритмов
-  DATA.algorithms.forEach((algo, idx) => {{
+  DATA.algorithms.forEach((algo, idx) => {
     const opt = document.createElement("option");
     opt.value = String(idx);
     opt.textContent = algo.label;
     algoSelect.appendChild(opt);
-  }});
+  });
 
-  algoSelect.addEventListener("change", (e) => {{
+  algoSelect.addEventListener("change", (e) => {
     const idx = parseInt(e.target.value, 10) || 0;
     initAlgorithm(idx);
-  }});
+  });
 
-  // Анимация: один проход для текущего алгоритма
-  const SPEED = 80; // пикселей в секунду
-
-  function animate(timestamp) {{
-    if (lastTime === null) {{
-      lastTime = timestamp;
-    }}
-    const dt = (timestamp - lastTime) / 1000;
-    lastTime = timestamp;
+  function animate(timestamp) {
+    if (lastAnimTime === null) {
+      lastAnimTime = timestamp;
+    }
+    const dt = (timestamp - lastAnimTime) / 1000.0;
+    lastAnimTime = timestamp;
 
     let allFinished = true;
 
-    for (const route of ROUTES) {{
-      if (route.finished || route.totalLen === 0) continue;
+    for (const route of ROUTES) {
+      if (route.finished || route.totalTime === 0) continue;
 
-      route.dist += SPEED * dt;
-      if (route.dist >= route.totalLen) {{
-        route.dist = route.totalLen;
+      route.time += SPEED * dt;
+      if (route.time >= route.totalTime) {
+        route.time = route.totalTime;
         route.finished = true;
-      }} else {{
+      } else {
         allFinished = false;
-      }}
-    }}
+      }
+    }
 
-    // обновляем статусы доставок
-    for (const d of deliveries) {{
+    // обновляем статусы доставок по ВРЕМЕНИ
+    for (const d of deliveries) {
       if (d.served) continue;
       const route = ROUTES.find(r => r.vehicle_id === d.vehicle_id);
       if (!route) continue;
-      if (route.dist >= d.arrival_dist) {{
+      if (route.time >= d.arrival_time) {
         d.served = true;
         visitedDeliveryNodes.add(d.node_id);
-      }}
-    }}
+      }
+    }
 
-    // обновляем виртуальное время и таймер
     simTime += dt;
     updateTimerLabel();
 
     draw();
 
-    if (!allFinished) {{
+    if (!allFinished) {
       requestAnimationFrame(animate);
-    }}
-  }}
+    }
+  }
 
   // старт: первый алгоритм
-  if (DATA.algorithms.length > 0) {{
+  if (DATA.algorithms.length > 0) {
     algoSelect.value = "0";
     initAlgorithm(0);
-  }}
+  }
 </script>
 </body>
 </html>
 """
+
+    html = html_template.replace("{{JSON_DATA}}", json_data)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)

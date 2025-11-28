@@ -45,19 +45,47 @@ def route_time(
     depot: NodeId,
     stops: List[DeliveryRequest],
     dist: Dict[Tuple[NodeId, NodeId], float],
+    vehicle_capacity: int,
 ) -> float:
     """
-    Стоимость маршрута: depot -> stops... -> depot.
+    Время маршрута с учётом capacity:
+    - стартуем из depot,
+    - за один рейс можно увезти не более vehicle_capacity demand,
+    - если места не хватает под следующий заказ -> возвращаемся на depot и начинаем новый рейс.
     """
     if not stops:
         return 0.0
+    if vehicle_capacity <= 0:
+        return INF
+
     total = 0.0
     cur = depot
+    cap_left = vehicle_capacity
+
     for r in stops:
+        demand = getattr(r, "demand", 1)
+        if demand <= 0:
+            return INF
+
+        # не хватает места — сначала домой
+        if cap_left < demand:
+            if cur != depot:
+                total += dist[(cur, depot)]
+                cur = depot
+            cap_left = vehicle_capacity
+
+        # едем к заказу
         total += dist[(cur, r.node)]
         cur = r.node
-    total += dist[(cur, depot)]
+        cap_left -= demand
+
+    # в конце возвращаемся на depot
+    if cur != depot:
+        total += dist[(cur, depot)]
+
     return total
+
+
 
 
 def build_tsp_route_nearest_neighbor(
@@ -98,21 +126,19 @@ def init_state_random(
     requests: List[DeliveryRequest],
     rng: random.Random,
 ) -> State:
-
     state: State = {v.id: [] for v in vehicles}
-    caps: Dict[str, int] = {v.id: v.capacity for v in vehicles}
 
     shuffled = requests[:]
     rng.shuffle(shuffled)
+
+    # просто равномерно/случайно разбрасываем заказы по машинам
     for req in shuffled:
-        feasible = [v.id for v in vehicles if len(state[v.id]) < caps[v.id]]
-        if not feasible:
-            min_vid = min(state.keys(), key=lambda vid: len(state[vid]))
-            state[min_vid].append(req)
-        else:
-            vid = rng.choice(feasible)
-            state[vid].append(req)
+        v = rng.choice(vehicles)
+        state[v.id].append(req)
+
     return state
+
+
 
 
 def evaluate_state(
@@ -121,16 +147,23 @@ def evaluate_state(
     state: State,
     dist: Dict[Tuple[NodeId, NodeId], float],
 ) -> float:
-
     makespan = 0.0
+
     for v in vehicles:
+        if v.capacity <= 0:
+            return INF  # машина с нулевым capacity делает задачу невозможной
+
         reqs = state[v.id]
         if not reqs:
             continue
+
         order = build_tsp_route_nearest_neighbor(depot, reqs, dist)
-        cost = route_time(depot, order, dist)
+        cost = route_time(depot, order, dist, v.capacity)
         makespan = max(makespan, cost)
+
     return makespan
+
+
 
 
 def random_move(

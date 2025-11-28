@@ -108,14 +108,14 @@ def main() -> None:
     depot = "C_GATE_S"
 
     vehicles = [
-        Vehicle(id="V1", capacity=4, start_node=depot),
-        Vehicle(id="V2", capacity=4, start_node=depot),
+        Vehicle(id="V1", capacity=3, start_node=depot),
+        Vehicle(id="V2", capacity=5, start_node=depot),
         Vehicle(id="V3", capacity=4, start_node=depot),
     ]
 
     # генерим случайные, но уникальные по нодам запросы
     requests: list[DeliveryRequest] = generate_random_requests(
-        graph, depot, rng, n_requests=9
+        graph, depot, rng, n_requests=20
     )
 
     validate_inputs(vehicles, requests)
