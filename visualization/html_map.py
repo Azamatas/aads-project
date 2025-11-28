@@ -5,8 +5,8 @@ import json
 import os
 import math
 
-from city.graph import CityGraph
-from domain.models import Plan, Vehicle, DeliveryRequest  # важно: импорт DeliveryRequest
+from city.graph import CityGraph, NodeId
+from domain.models import Plan, Vehicle, DeliveryRequest  # DeliveryRequest на будущее
 from algorithms.a_star import astar_shortest_path
 
 
@@ -81,7 +81,7 @@ def export_plan_to_html(
       - маршрутами машин,
       - анимацией движения машин по маршрутам (один прогон),
       - pan/zoom мышью.
-    Дороги серые, точки-доставки изначально красные, после визита — жёлтые.
+    Дороги серые, точки-доставки сразу окрашены в цвет машины, после визита становятся крупнее.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -211,7 +211,7 @@ def export_plan_to_html(
 <body>
 <div id="card">
   <h1 id="title">Constructor University — Delivery Routes</h1>
-  <p id="subtitle">Drag to pan, scroll to zoom, deliveries turn red → yellow when visited</p>
+  <p id="subtitle">Nodes are colored by vehicle; delivered requests become larger</p>
   <div id="legend"></div>
   <canvas id="map" width="900" height="700"></canvas>
 </div>
@@ -222,6 +222,16 @@ def export_plan_to_html(
   const colors = [
     "#f97316", "#22c55e", "#3b82f6", "#e11d48",
     "#a855f7", "#14b8a6", "#facc15"
+  ];
+
+  const dashPatterns = [
+    [],            // solid
+    [10, 6],       // long dash
+    [4, 4],        // medium dash
+    [14, 4, 2, 4], // dash-dot
+    [2, 6],        // dotted-ish
+    [1, 3],        // fine dots
+    [12, 3, 3, 3], // long-short pattern
   ];
 
   const canvas = document.getElementById("map");
@@ -235,11 +245,7 @@ def export_plan_to_html(
   let dragStartX = 0;
   let dragStartY = 0;
 
-  const DELIVERY_NODES = new Set(DATA.delivery_nodes || []);
-  const deliveries = (DATA.deliveries || []).map(d => ({{ ...d, served: false }}));
-  const visitedDeliveryNodes = new Set();
-ч
-  // Подготовка данных для анимации
+  // 1) Сначала готовим маршруты
   const ROUTES = DATA.routes.map((route, idx) => {{
     const pts = route.nodes;
     const segments = [];
@@ -260,10 +266,26 @@ def export_plan_to_html(
       color: colors[idx % colors.length],
       segments,
       totalLen,
-      dist: 0,        // текущая пройденная дистанция по маршруту
-      finished: false // закончил ли маршрут
+      dist: 0,
+      finished: false,
     }};
   }});
+
+  // 2) Структуры для доставок
+  const DELIVERY_NODES = new Set(DATA.delivery_nodes || []);
+  const deliveries = (DATA.deliveries || []).map(
+    d => Object.assign({{ served: false }}, d)
+  );
+  const visitedDeliveryNodes = new Set();
+  const deliveryColorByNode = new Map();
+
+  // 3) Сразу красим каждую ноду-заказ в цвет её машины
+  for (const d of deliveries) {{
+    const route = ROUTES.find(r => r.vehicle_id === d.vehicle_id);
+    if (route && !deliveryColorByNode.has(d.node_id)) {{
+      deliveryColorByNode.set(d.node_id, route.color);
+    }}
+  }}
 
   function draw() {{
     ctx.save();
@@ -275,7 +297,7 @@ def export_plan_to_html(
     ctx.fillStyle = "#020617";
     ctx.fillRect(-2000, -2000, 4000, 4000);
 
-    // 1) серые дороги (всегда)
+    // серые дороги
     ctx.strokeStyle = "#1f2937";
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -287,13 +309,17 @@ def export_plan_to_html(
     }}
     ctx.stroke();
 
-    // 2) цветные "следы" машин по уже проезженному участку
-    for (const route of ROUTES) {{
-      if (route.segments.length === 0 || route.dist <= 0) continue;
+    // цветные "следы" машин
+    ROUTES.forEach((route, idx) => {{
+      if (route.segments.length === 0 || route.dist <= 0) return;
 
       let remaining = route.dist;
+
+      ctx.save();
       ctx.strokeStyle = route.color;
-      ctx.lineWidth = 3;
+      ctx.lineWidth = 6;
+      ctx.setLineDash(dashPatterns[idx % dashPatterns.length]);
+
       ctx.beginPath();
       let started = false;
 
@@ -323,33 +349,51 @@ def export_plan_to_html(
       }}
 
       ctx.stroke();
-    }}
+      ctx.restore();
+    }});
 
-    // 3) узлы (цвет зависит от статуса)
+    // узлы
     for (const node of DATA.nodes) {{
       const nodeId = node.id;
       const isDepot = (nodeId === DATA.depot);
       const isDelivery = DELIVERY_NODES.has(nodeId);
       const isVisited = visitedDeliveryNodes.has(nodeId);
 
-      let fillColor = "#e5e7eb"; // обычный
-      if (isDepot) fillColor = "#22c55e";           // депо — зелёный
-      else if (isDelivery && !isVisited) fillColor = "#ef4444"; // доставка ещё не выполнена — красный
-      else if (isDelivery && isVisited) fillColor = "#facc15";  // доставка выполнена — жёлтый
+      let fillColor = "#e5e7eb";
+      let radius = 3;
+
+      if (isDepot) {{
+        fillColor = "#22c55e";
+        radius = 6;
+      }} else if (isDelivery) {{
+        const vehicleColor = deliveryColorByNode.get(nodeId) || "#ef4444";
+        if (!isVisited) {{
+          fillColor = vehicleColor;
+          radius = 6;
+        }} else {{
+          fillColor = vehicleColor;
+          radius = 8;
+        }}
+      }}
 
       ctx.beginPath();
-      const r = isDepot ? 5 : 3;
-      ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
+      ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
       ctx.fillStyle = fillColor;
       ctx.fill();
+
+      if (isDelivery) {{
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "#111827";
+        ctx.stroke();
+      }}
 
       ctx.fillStyle = "#9ca3af";
       ctx.font = "10px system-ui";
       ctx.textAlign = "center";
-      ctx.fillText(node.id, node.x, node.y - 7);
+      ctx.fillText(node.id, node.x, node.y - (radius + 4));
     }}
 
-    // 4) сами машинки (кружочки на текущей позиции)
+    // машинки
     for (const route of ROUTES) {{
       if (route.segments.length === 0 || route.totalLen === 0) continue;
 
@@ -364,7 +408,7 @@ def export_plan_to_html(
 
           ctx.beginPath();
           ctx.fillStyle = route.color;
-          ctx.arc(x, y, 6, 0, Math.PI * 2);
+          ctx.arc(x, y, 8, 0, Math.PI * 2);
           ctx.fill();
           break;
         }}
@@ -409,7 +453,7 @@ def export_plan_to_html(
     draw();
   }}, {{ passive: false }});
 
-  // легенда (только по машинам)
+  // легенда по машинам
   const legendEl = document.getElementById("legend");
   ROUTES.forEach((route) => {{
     const item = document.createElement("div");
@@ -432,7 +476,7 @@ def export_plan_to_html(
     if (lastTime === null) {{
       lastTime = timestamp;
     }}
-    const dt = (timestamp - lastTime) / 1000; // секунды
+    const dt = (timestamp - lastTime) / 1000;
     lastTime = timestamp;
 
     let allFinished = true;
@@ -457,6 +501,7 @@ def export_plan_to_html(
       if (route.dist >= d.arrival_dist) {{
         d.served = true;
         visitedDeliveryNodes.add(d.node_id);
+        // цвет не меняем: он уже задан по машине
       }}
     }}
 
